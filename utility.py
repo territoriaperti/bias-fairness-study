@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import itertools
-from IPython.display import display
+from IPython.display import display, Markdown
 from numpy.random import default_rng
 from collections import OrderedDict
 from copy import deepcopy
@@ -12,20 +12,22 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from aif360.metrics import BinaryLabelDatasetMetric, ClassificationMetric
 from aif360.datasets import BinaryLabelDataset
+from aif360.algorithms import Transformer
 
-sns.set_theme(style='darkgrid')
+sns.set_theme(style='whitegrid')
 
 
 # utility functions
-def compute_dataset_fairness_metrics(data: BinaryLabelDataset, unpriv_group: list, priv_group: list):
+def compute_dataset_fairness_metrics(data: BinaryLabelDataset, unpriv_group: list, priv_group: list, disp=True):
     """ Computes: Disparate Impact and Statistical Parity """
 
     b = BinaryLabelDatasetMetric(data, unprivileged_groups=unpriv_group, privileged_groups=priv_group)
     metrics = dict()
     metrics['Disparate Impact'] = b.disparate_impact()
     metrics['Statistical Parity'] = b.statistical_parity_difference()
-    for k in metrics:
-        print("%s = %.4f" % (k, metrics[k]))
+    if disp:
+        for k in metrics:
+            print("%s = %.4f" % (k, metrics[k]))
     return metrics
 
 
@@ -46,10 +48,10 @@ def compute_fairness_metrics(dataset_true, dataset_pred,
     metrics = OrderedDict()
     metrics["Balanced accuracy"] = 0.5 * (classified_metric_pred.true_positive_rate() +
                                           classified_metric_pred.true_negative_rate())
-    metrics["Statistical parity difference"] = classified_metric_pred.statistical_parity_difference()
+    metrics["Statistical parity"] = classified_metric_pred.statistical_parity_difference()
     metrics["Disparate impact"] = classified_metric_pred.disparate_impact()
-    metrics["Average odds difference"] = classified_metric_pred.average_odds_difference()
-    metrics["Equal opportunity difference"] = classified_metric_pred.equal_opportunity_difference()
+    metrics["Average odds"] = classified_metric_pred.average_odds_difference()
+    metrics["Equal opportunity"] = classified_metric_pred.equal_opportunity_difference()
     metrics["Theil index"] = classified_metric_pred.theil_index()
 
     if disp:
@@ -215,13 +217,11 @@ def plot_metrics_comparison(bias_class_metrics, rw_class_metrics, title1='', tit
 
 
 def plot_syntesis(dataset, title):
-    fig, ax = plt.subplots(1, 1, figsize=(12, 5))
+    fig, ax = plt.subplots(1, 1, figsize=(13, 5))
     sns.barplot(data=dataset, x='metrics', y='values', hue='Dataset', ax=ax)
     plt.ylabel(ylabel='')
     plt.xlabel(xlabel='')
     plt.title(title)
-    #plt.tick_params(labelrotation=45)
-    plt.tight_layout()
     display(dataset.pivot(index='Dataset', values='values', columns='metrics'))
     return ax
 
@@ -264,7 +264,7 @@ def sample_dataset(dataframe: pd.DataFrame,
     groups = [df[cond & fav_label] for cond in groups_condition] + [df[cond & unfav_label] for cond in groups_condition]
     exp_weights = ([(len(df[cond]) / len(df)) * (len(df[fav_label]) / len(df)) for cond in groups_condition] +
                    [(len(df[cond]) / len(df)) * (len(df[unfav_label]) / len(df)) for cond in groups_condition])
-    obs_weights = [len(group)/len(df) for group in groups]
+    obs_weights = [len(group) / len(df) for group in groups]
     disparities = []
     for i in range(len(groups)):
         groups[i], d = balance_set(exp_weights[i], obs_weights[i], groups[i], df, round_level, debug)
@@ -280,19 +280,25 @@ def classify(estimator: Pipeline,
              data: BinaryLabelDataset,
              priv_group: list,
              unpriv_group: list,
-             sensitive_attributes=None, 
+             sensitive_attributes=None,
              show=True,
-             n_splits = 10):
+             n_splits=10,
+             debiaser: Transformer = None,
+             ):
     if sensitive_attributes is None:
         sensitive_attributes = []
     np_data = np.hstack((data.features, data.labels))
     kf = KFold(n_splits=n_splits, shuffle=True)
+    dataset_metrics = []
     class_metrics = []
     quality_metrics_p = []
     quality_metrics_u = []
     for train, test in kf.split(np_data):
         d_train = data.subset(train)
         d_test = data.subset(test)
+        if debiaser:
+            d_train = debiaser.fit_transform(d_train)
+            #d_test = debiaser.transform(d_test)
         x_train, y_train, x_test, y_test = x_y_split(d_train, d_test, sensitive_attributes)
         if sensitive_attributes:
             indexes = [d_train.feature_names.index(s) for s in sensitive_attributes]
@@ -301,11 +307,13 @@ def classify(estimator: Pipeline,
         pipe.fit(x_train, y_train, logisticregression__sample_weight=d_train.instance_weights.ravel())
         pred = d_test.copy()
         pred.labels = pipe.predict(x_test)
+        data_metric = compute_dataset_fairness_metrics(d_train, unpriv_group, priv_group, disp=False)
         metric = compute_fairness_metrics(d_test, pred, unpriv_group, priv_group, disp=False)
         q_metric_p, q_metric_u = compute_quality_metrics(d_test, pred, unpriv_group, priv_group)
         quality_metrics_p.append(q_metric_p)
         quality_metrics_u.append(q_metric_u)
         class_metrics.append(metric)
+        dataset_metrics.append(data_metric)
 
     ris = {key: round(np.mean([metric[key] for metric in class_metrics]), 4) for key in class_metrics[0]}
     q_metrics_p = {key: round(np.mean([metric[key] for metric in quality_metrics_p]), 4) for key in
@@ -313,8 +321,14 @@ def classify(estimator: Pipeline,
     q_metrics_u = {key: round(np.mean([metric[key] for metric in quality_metrics_u]), 4) for key in
                    quality_metrics_u[0]}
     q_metrics = pd.DataFrame(data=[q_metrics_p, q_metrics_u], index=['Privileged', 'Unprivileged'])
+    d_metrics = {key: round(np.mean([metric[key] for metric in dataset_metrics]), 4) for key in dataset_metrics[0]}
     plot_quality_metrics(q_metrics)
     if show:
+        display(Markdown('### Dataset Metrics:'))
+        for key, val in d_metrics.items():
+            print("%s: %.4f" % (key, val))
+        print("\n")
+        display(Markdown('### Classification Metrics:'))
         for key, val in ris.items():
             print("%s: %.4f" % (key, val))
     return ris
